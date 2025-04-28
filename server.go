@@ -385,7 +385,17 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 		}
 
 	case s.service.ServiceInstanceName():
-		s.composeLookupAnswers(resp, s.ttl, ifIndex, false)
+		switch q.Qtype {
+		case dns.TypeSRV:
+			s.serverInfo(resp, s.ttl, ifIndex, false)
+		default:
+			s.composeLookupAnswers(resp, s.ttl, ifIndex, false)
+		}
+	case s.service.HostName:
+		switch q.Qtype {
+		case dns.TypeA, dns.TypeAAAA:
+			resp.Answer = s.appendAddrs(resp.Answer, s.ttl, ifIndex, false)
+		}
 	default:
 		// handle matching subtype query
 		for _, subtype := range s.service.Subtypes {
@@ -504,6 +514,24 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, fl
 	resp.Answer = s.appendAddrs(resp.Answer, ttl, ifIndex, flushCache)
 }
 
+func (s *Server) serverInfo(resp *dns.Msg, ttl uint32, ifIndex int, flushCache bool) {
+	srv := &dns.SRV{
+		Hdr: dns.RR_Header{
+			Name:   s.service.ServiceInstanceName(),
+			Rrtype: dns.TypeSRV,
+			Class:  dns.ClassINET | qClassCacheFlush,
+			Ttl:    ttl,
+		},
+		Priority: 0,
+		Weight:   0,
+		Port:     uint16(s.service.Port),
+		Target:   s.service.HostName,
+	}
+
+	resp.Answer = append(resp.Answer, srv)
+	resp.Answer = s.appendAddrs(resp.Answer, ttl, ifIndex, flushCache)
+}
+
 func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
 	// From RFC6762
 	// 9.  Service Type Enumeration
@@ -526,7 +554,7 @@ func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
 }
 
 // Perform probing & announcement
-//TODO: implement a proper probing & conflict resolution
+// TODO: implement a proper probing & conflict resolution
 func (s *Server) probe() {
 	q := new(dns.Msg)
 	q.SetQuestion(s.service.ServiceInstanceName(), dns.TypePTR)
