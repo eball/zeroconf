@@ -395,6 +395,8 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 		switch q.Qtype {
 		case dns.TypeA, dns.TypeAAAA:
 			resp.Answer = s.appendAddrs(resp.Answer, s.ttl, ifIndex, false)
+		case dns.TypeSRV:
+			s.serverInfo(resp, s.ttl, ifIndex, false)
 		}
 	default:
 		// handle matching subtype query
@@ -429,7 +431,7 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifIndex int) {
 		Hdr: dns.RR_Header{
 			Name:   s.service.ServiceInstanceName(),
 			Rrtype: dns.TypeTXT,
-			Class:  dns.ClassINET,
+			Class:  dns.ClassINET | qClassCacheFlush,
 			Ttl:    s.ttl,
 		},
 		Txt: s.service.Text,
@@ -438,7 +440,7 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifIndex int) {
 		Hdr: dns.RR_Header{
 			Name:   s.service.ServiceInstanceName(),
 			Rrtype: dns.TypeSRV,
-			Class:  dns.ClassINET,
+			Class:  dns.ClassINET | qClassCacheFlush,
 			Ttl:    s.ttl,
 		},
 		Priority: 0,
@@ -446,9 +448,11 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifIndex int) {
 		Port:     uint16(s.service.Port),
 		Target:   s.service.HostName,
 	}
-	resp.Extra = append(resp.Extra, srv, txt)
+	resp.Answer = append(resp.Answer, txt, srv)
+	resp.Answer = s.appendAddrs(resp.Answer, s.ttl, ifIndex, true)
+	// resp.Extra = append(resp.Extra, srv, txt)
 
-	resp.Extra = s.appendAddrs(resp.Extra, s.ttl, ifIndex, false)
+	// resp.Extra = s.appendAddrs(resp.Extra, s.ttl, ifIndex, false)
 }
 
 func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, flushCache bool) {
