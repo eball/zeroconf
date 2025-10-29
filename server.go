@@ -154,6 +154,8 @@ type Server struct {
 	shutdownEnd    sync.WaitGroup
 	isShutdown     bool
 	ttl            uint32
+
+	hostAliases map[string]bool
 }
 
 // Constructs server structure
@@ -177,6 +179,7 @@ func newServer(ifaces []net.Interface) (*Server, error) {
 		ifaces:         ifaces,
 		ttl:            3200,
 		shouldShutdown: make(chan struct{}),
+		hostAliases:    make(map[string]bool),
 	}
 
 	return s, nil
@@ -371,30 +374,30 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 		return nil
 	}
 
-	switch q.Name {
-	case s.service.ServiceTypeName():
+	switch {
+	case q.Name == s.service.ServiceTypeName():
 		s.serviceTypeName(resp, s.ttl)
 		if isKnownAnswer(resp, query) {
 			resp.Answer = nil
 		}
 
-	case s.service.ServiceName():
+	case q.Name == s.service.ServiceName():
 		s.composeBrowsingAnswers(resp, ifIndex)
 		if isKnownAnswer(resp, query) {
 			resp.Answer = nil
 		}
 
-	case s.service.ServiceInstanceName():
+	case q.Name == s.service.ServiceInstanceName():
 		switch q.Qtype {
 		case dns.TypeSRV:
 			s.serverInfo(resp, s.ttl, ifIndex, false)
 		default:
 			s.composeLookupAnswers(resp, s.ttl, ifIndex, false)
 		}
-	case s.service.HostName:
+	case q.Name == s.service.HostName, s.hostAliases[q.Name]:
 		switch q.Qtype {
 		case dns.TypeA, dns.TypeAAAA:
-			resp.Answer = s.appendAddrs(resp.Answer, s.ttl, ifIndex, false)
+			resp.Answer = s.appendAddrs(resp.Answer, s.ttl, ifIndex, false, q.Name)
 		case dns.TypeSRV:
 			s.serverInfo(resp, s.ttl, ifIndex, false)
 		}
@@ -449,7 +452,7 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifIndex int) {
 		Target:   s.service.HostName,
 	}
 	resp.Answer = append(resp.Answer, txt, srv)
-	resp.Answer = s.appendAddrs(resp.Answer, s.ttl, ifIndex, true)
+	resp.Answer = s.appendAddrs(resp.Answer, s.ttl, ifIndex, true, "")
 	// resp.Extra = append(resp.Extra, srv, txt)
 
 	// resp.Extra = s.appendAddrs(resp.Extra, s.ttl, ifIndex, false)
@@ -515,7 +518,7 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, fl
 			})
 	}
 
-	resp.Answer = s.appendAddrs(resp.Answer, ttl, ifIndex, flushCache)
+	resp.Answer = s.appendAddrs(resp.Answer, ttl, ifIndex, flushCache, "")
 }
 
 func (s *Server) serverInfo(resp *dns.Msg, ttl uint32, ifIndex int, flushCache bool) {
@@ -533,7 +536,7 @@ func (s *Server) serverInfo(resp *dns.Msg, ttl uint32, ifIndex int, flushCache b
 	}
 
 	resp.Answer = append(resp.Answer, srv)
-	resp.Answer = s.appendAddrs(resp.Answer, ttl, ifIndex, flushCache)
+	resp.Answer = s.appendAddrs(resp.Answer, ttl, ifIndex, flushCache, "")
 }
 
 func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
@@ -649,7 +652,7 @@ func (s *Server) unregister() error {
 	return s.multicastResponse(resp, 0)
 }
 
-func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache bool) []dns.RR {
+func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache bool, alias string) []dns.RR {
 	v4 := s.service.AddrIPv4
 	v6 := s.service.AddrIPv6
 	if len(v4) == 0 && len(v6) == 0 {
@@ -670,10 +673,15 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 	if flushCache {
 		cacheFlushBit = qClassCacheFlush
 	}
+	hostname := s.service.HostName
+	if alias != "" && s.hostAliases[alias] {
+		hostname = alias
+	}
+
 	for _, ipv4 := range v4 {
 		a := &dns.A{
 			Hdr: dns.RR_Header{
-				Name:   s.service.HostName,
+				Name:   hostname,
 				Rrtype: dns.TypeA,
 				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
@@ -685,7 +693,7 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 	for _, ipv6 := range v6 {
 		aaaa := &dns.AAAA{
 			Hdr: dns.RR_Header{
-				Name:   s.service.HostName,
+				Name:   hostname,
 				Rrtype: dns.TypeAAAA,
 				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
@@ -826,4 +834,13 @@ func isUnicastQuestion(q dns.Question) bool {
 	//    qclass field is used to indicate that unicast responses are preferred
 	//    for this particular question.  (See Section 5.4.)
 	return q.Qclass&qClassCacheFlush != 0
+}
+
+func (s *Server) AddHostAlias(alias string) error {
+	s.hostAliases[alias] = true
+	return nil
+}
+
+func (s *Server) RemoveHostAlias(alias string) {
+	delete(s.hostAliases, alias)
 }
