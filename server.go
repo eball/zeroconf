@@ -25,6 +25,10 @@ const (
 // Register a service by given arguments. This call will take the system's hostname
 // and lookup IP by that hostname.
 func Register(instance, service, domain, hostname string, port int, text []string, ifaces []net.Interface) (*Server, error) {
+	return RegisterAll(instance, service, domain, hostname, port, text, ifaces, true)
+}
+
+func RegisterAll(instance, service, domain, hostname string, port int, text []string, ifaces []net.Interface, withoutIpV6 bool) (*Server, error) {
 	entry := NewServiceEntry(instance, service, domain)
 	entry.Port = port
 	entry.Text = text
@@ -62,7 +66,9 @@ func Register(instance, service, domain, hostname string, port int, text []strin
 	for _, iface := range ifaces {
 		v4, v6 := addrsForInterface(&iface)
 		entry.AddrIPv4 = append(entry.AddrIPv4, v4...)
-		entry.AddrIPv6 = append(entry.AddrIPv6, v6...)
+		if !withoutIpV6 {
+			entry.AddrIPv6 = append(entry.AddrIPv6, v6...)
+		}
 	}
 
 	if entry.AddrIPv4 == nil && entry.AddrIPv6 == nil {
