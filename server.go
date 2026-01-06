@@ -839,7 +839,9 @@ func isUnicastQuestion(q dns.Question) bool {
 	//    In the Question Section of a Multicast DNS query, the top bit of the
 	//    qclass field is used to indicate that unicast responses are preferred
 	//    for this particular question.  (See Section 5.4.)
-	return q.Qclass&qClassCacheFlush != 0
+	// return q.Qclass&qClassCacheFlush != 0
+
+	return true
 }
 
 func (s *Server) AddHostAlias(alias string) error {
