@@ -320,7 +320,7 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 		resp.Compress = true
 		resp.RecursionDesired = false
 		resp.Authoritative = true
-		resp.Question = nil // RFC6762 section 6 "responses MUST NOT contain any questions"
+		// resp.Question = nil // RFC6762 section 6 "responses MUST NOT contain any questions"
 		resp.Answer = []dns.RR{}
 		resp.Extra = []dns.RR{}
 		if err = s.handleQuestion(q, &resp, query, ifIndex); err != nil {
