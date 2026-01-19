@@ -25,10 +25,10 @@ const (
 // Register a service by given arguments. This call will take the system's hostname
 // and lookup IP by that hostname.
 func Register(instance, service, domain, hostname string, port int, text []string, ifaces []net.Interface) (*Server, error) {
-	return RegisterAll(instance, service, domain, hostname, port, text, ifaces, true, true)
+	return RegisterAll(instance, service, domain, hostname, port, text, ifaces, true, true, true)
 }
 
-func RegisterAll(instance, service, domain, hostname string, port int, text []string, ifaces []net.Interface, withoutIpV6 bool, withQuery bool) (*Server, error) {
+func RegisterAll(instance, service, domain, hostname string, port int, text []string, ifaces []net.Interface, withoutIpV6 bool, withQuery bool, forceUnicast bool) (*Server, error) {
 	entry := NewServiceEntry(instance, service, domain)
 	entry.Port = port
 	entry.Text = text
@@ -82,6 +82,7 @@ func RegisterAll(instance, service, domain, hostname string, port int, text []st
 
 	s.service = entry
 	s.withQuery = withQuery
+	s.forceUnicast = forceUnicast
 	go s.mainloop()
 	go s.probe()
 
@@ -164,7 +165,8 @@ type Server struct {
 
 	hostAliases map[string]bool
 
-	withQuery bool
+	withQuery    bool
+	forceUnicast bool
 }
 
 // Constructs server structure
@@ -337,7 +339,7 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 			continue
 		}
 
-		if isUnicastQuestion(q) {
+		if s.forceUnicast || isUnicastQuestion(q) {
 			// Send unicast
 			if e := s.unicastResponse(&resp, ifIndex, from); e != nil {
 				err = e
@@ -844,9 +846,7 @@ func isUnicastQuestion(q dns.Question) bool {
 	//    In the Question Section of a Multicast DNS query, the top bit of the
 	//    qclass field is used to indicate that unicast responses are preferred
 	//    for this particular question.  (See Section 5.4.)
-	// return q.Qclass&qClassCacheFlush != 0
-
-	return true
+	return q.Qclass&qClassCacheFlush != 0
 }
 
 func (s *Server) AddHostAlias(alias string) error {
