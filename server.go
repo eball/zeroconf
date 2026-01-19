@@ -25,10 +25,10 @@ const (
 // Register a service by given arguments. This call will take the system's hostname
 // and lookup IP by that hostname.
 func Register(instance, service, domain, hostname string, port int, text []string, ifaces []net.Interface) (*Server, error) {
-	return RegisterAll(instance, service, domain, hostname, port, text, ifaces, true)
+	return RegisterAll(instance, service, domain, hostname, port, text, ifaces, true, true)
 }
 
-func RegisterAll(instance, service, domain, hostname string, port int, text []string, ifaces []net.Interface, withoutIpV6 bool) (*Server, error) {
+func RegisterAll(instance, service, domain, hostname string, port int, text []string, ifaces []net.Interface, withoutIpV6 bool, withQuery bool) (*Server, error) {
 	entry := NewServiceEntry(instance, service, domain)
 	entry.Port = port
 	entry.Text = text
@@ -81,6 +81,7 @@ func RegisterAll(instance, service, domain, hostname string, port int, text []st
 	}
 
 	s.service = entry
+	s.withQuery = withQuery
 	go s.mainloop()
 	go s.probe()
 
@@ -162,6 +163,8 @@ type Server struct {
 	ttl            uint32
 
 	hostAliases map[string]bool
+
+	withQuery bool
 }
 
 // Constructs server structure
@@ -320,7 +323,9 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 		resp.Compress = true
 		resp.RecursionDesired = false
 		resp.Authoritative = true
-		// resp.Question = nil // RFC6762 section 6 "responses MUST NOT contain any questions"
+		if !s.withQuery {
+			resp.Question = nil // RFC6762 section 6 "responses MUST NOT contain any questions"
+		}
 		resp.Answer = []dns.RR{}
 		resp.Extra = []dns.RR{}
 		if err = s.handleQuestion(q, &resp, query, ifIndex); err != nil {
