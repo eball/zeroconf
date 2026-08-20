@@ -148,6 +148,22 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 
 const (
 	qClassCacheFlush uint16 = 1 << 15
+
+	// multicastDNSPort is the well-known Multicast DNS port. A query arriving
+	// from any other source port comes from a simple resolver rather than a
+	// full Multicast DNS client, and must be answered differently.
+	multicastDNSPort = 5353
+
+	// legacyUnicastTTL caps the record TTL of legacy unicast responses. RFC
+	// 6762 section 6.7 suggests 10 seconds, on the grounds that a legacy
+	// resolver never sees the multicast traffic that would correct a stale
+	// entry. On a wireless network that trade is a bad one: every expiry costs
+	// another multicast query, and multicast frames carry no acknowledgement
+	// and are never retransmitted, so a sizeable share of them are simply
+	// lost. Matching the 120 seconds that section 10 gives address records
+	// cuts the number of those coin flips by an order of magnitude, and an
+	// address change still corrects itself within two minutes.
+	legacyUnicastTTL uint32 = 120
 )
 
 // Server structure encapsulates both IPv4/IPv6 UDP connections
@@ -320,6 +336,16 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 		return nil
 	}
 
+	// RFC6762 section 6.7: a query whose source port is not 5353 was sent by a
+	// simple resolver such as res_query(), which pairs a reply with its request
+	// by comparing the question section and only listens for a unicast answer.
+	// A full Multicast DNS client instead queries from port 5353, expects a
+	// multicast answer, and discards any reply that carries a question section.
+	legacyUnicast := false
+	if addr, ok := from.(*net.UDPAddr); ok && addr.Port != multicastDNSPort {
+		legacyUnicast = true
+	}
+
 	// Handle each question
 	var err error
 	for _, q := range query.Question {
@@ -328,7 +354,7 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 		resp.Compress = true
 		resp.RecursionDesired = false
 		resp.Authoritative = true
-		if !s.withQuery {
+		if !s.withQuery && !legacyUnicast {
 			resp.Question = nil // RFC6762 section 6 "responses MUST NOT contain any questions"
 		}
 		resp.Answer = []dns.RR{}
@@ -337,12 +363,26 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 			// log.Printf("[ERR] zeroconf: failed to handle question %v: %v", q, err)
 			continue
 		}
-		// Check if there is an answer
-		if len(resp.Answer) == 0 {
+		// Check if there is anything to send back. A negative response carries
+		// no answer, only an NSEC record in the additional section.
+		if len(resp.Answer) == 0 && len(resp.Extra) == 0 {
 			continue
 		}
 
-		if s.forceUnicast || isUnicastQuestion(q) {
+		if legacyUnicast {
+			// RFC6762 section 6.7: a legacy resolver has no Multicast DNS cache
+			// to flush, so the cache-flush bit must be cleared, and its record
+			// lifetime is bounded by legacyUnicastTTL.
+			for _, rr := range append(append([]dns.RR{}, resp.Answer...), resp.Extra...) {
+				hdr := rr.Header()
+				hdr.Class &^= qClassCacheFlush
+				if hdr.Ttl > legacyUnicastTTL {
+					hdr.Ttl = legacyUnicastTTL
+				}
+			}
+		}
+
+		if legacyUnicast || s.forceUnicast || isUnicastQuestion(q) {
 			// Send unicast
 			if e := s.unicastResponse(&resp, ifIndex, from); e != nil {
 				err = e
@@ -413,7 +453,10 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 	case q.Name == s.service.HostName, s.isHostAlias(q.Name):
 		switch q.Qtype {
 		case dns.TypeA, dns.TypeAAAA:
-			resp.Answer = s.appendAddrs(resp.Answer, s.ttl, ifIndex, false, q.Name)
+			resp.Answer = s.appendAddrsOfType(resp.Answer, s.ttl, ifIndex, false, q.Name, q.Qtype)
+			if len(resp.Answer) == 0 {
+				resp.Extra = append(resp.Extra, s.hostNSEC(q.Name, ifIndex))
+			}
 		case dns.TypeSRV:
 			s.serverInfo(resp, s.ttl, ifIndex, false)
 		}
@@ -668,9 +711,11 @@ func (s *Server) unregister() error {
 	return s.multicastResponse(resp, 0)
 }
 
-func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache bool, alias string) []dns.RR {
-	v4 := s.service.AddrIPv4
-	v6 := s.service.AddrIPv6
+// addrsFor returns the addresses this server answers with on the given
+// interface.
+func (s *Server) addrsFor(ifIndex int) (v4 []net.IP, v6 []net.IP) {
+	v4 = s.service.AddrIPv4
+	v6 = s.service.AddrIPv6
 	if len(v4) == 0 && len(v6) == 0 {
 		iface, _ := net.InterfaceByIndex(ifIndex)
 		if iface != nil {
@@ -679,6 +724,42 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 			v6 = append(v6, a6...)
 		}
 	}
+	return v4, v6
+}
+
+// hostNSEC builds the negative response of RFC 6762 section 6.1: the name
+// exists, but not with the type that was asked for. Answering an AAAA query
+// with an A record instead leaves the querier with a reply it must discard,
+// and it will keep asking until it gives up.
+func (s *Server) hostNSEC(name string, ifIndex int) dns.RR {
+	v4, v6 := s.addrsFor(ifIndex)
+	nsec := &dns.NSEC{
+		Hdr: dns.RR_Header{
+			Name:   name,
+			Rrtype: dns.TypeNSEC,
+			Class:  dns.ClassINET | qClassCacheFlush,
+			Ttl:    120,
+		},
+		NextDomain: name,
+	}
+	// The bitmap must be in ascending type order, and dns.TypeA < dns.TypeAAAA.
+	if len(v4) > 0 {
+		nsec.TypeBitMap = append(nsec.TypeBitMap, dns.TypeA)
+	}
+	if len(v6) > 0 {
+		nsec.TypeBitMap = append(nsec.TypeBitMap, dns.TypeAAAA)
+	}
+	return nsec
+}
+
+func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache bool, alias string) []dns.RR {
+	return s.appendAddrsOfType(list, ttl, ifIndex, flushCache, alias, 0)
+}
+
+// appendAddrsOfType appends only the address records matching qtype. A qtype of
+// 0 selects every address record, which is what announcements need.
+func (s *Server) appendAddrsOfType(list []dns.RR, ttl uint32, ifIndex int, flushCache bool, alias string, qtype uint16) []dns.RR {
+	v4, v6 := s.addrsFor(ifIndex)
 	if ttl > 0 {
 		// RFC6762 Section 10 says A/AAAA records SHOULD
 		// use TTL of 120s, to account for network interface
@@ -694,29 +775,33 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 		hostname = alias
 	}
 
-	for _, ipv4 := range v4 {
-		a := &dns.A{
-			Hdr: dns.RR_Header{
-				Name:   hostname,
-				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET | cacheFlushBit,
-				Ttl:    ttl,
-			},
-			A: ipv4,
+	if qtype == 0 || qtype == dns.TypeA {
+		for _, ipv4 := range v4 {
+			a := &dns.A{
+				Hdr: dns.RR_Header{
+					Name:   hostname,
+					Rrtype: dns.TypeA,
+					Class:  dns.ClassINET | cacheFlushBit,
+					Ttl:    ttl,
+				},
+				A: ipv4,
+			}
+			list = append(list, a)
 		}
-		list = append(list, a)
 	}
-	for _, ipv6 := range v6 {
-		aaaa := &dns.AAAA{
-			Hdr: dns.RR_Header{
-				Name:   hostname,
-				Rrtype: dns.TypeAAAA,
-				Class:  dns.ClassINET | cacheFlushBit,
-				Ttl:    ttl,
-			},
-			AAAA: ipv6,
+	if qtype == 0 || qtype == dns.TypeAAAA {
+		for _, ipv6 := range v6 {
+			aaaa := &dns.AAAA{
+				Hdr: dns.RR_Header{
+					Name:   hostname,
+					Rrtype: dns.TypeAAAA,
+					Class:  dns.ClassINET | cacheFlushBit,
+					Ttl:    ttl,
+				},
+				AAAA: ipv6,
+			}
+			list = append(list, aaaa)
 		}
-		list = append(list, aaaa)
 	}
 	return list
 }
