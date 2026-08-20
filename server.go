@@ -163,7 +163,10 @@ type Server struct {
 	isShutdown     bool
 	ttl            uint32
 
-	hostAliases map[string]bool
+	// hostAliases is read by the receive loops and written by callers that
+	// track which names the host currently serves, so it needs a lock.
+	hostAliases     map[string]bool
+	hostAliasesLock sync.RWMutex
 
 	withQuery    bool
 	forceUnicast bool
@@ -407,7 +410,7 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 		default:
 			s.composeLookupAnswers(resp, s.ttl, ifIndex, false)
 		}
-	case q.Name == s.service.HostName, s.hostAliases[q.Name]:
+	case q.Name == s.service.HostName, s.isHostAlias(q.Name):
 		switch q.Qtype {
 		case dns.TypeA, dns.TypeAAAA:
 			resp.Answer = s.appendAddrs(resp.Answer, s.ttl, ifIndex, false, q.Name)
@@ -687,7 +690,7 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 		cacheFlushBit = qClassCacheFlush
 	}
 	hostname := s.service.HostName
-	if alias != "" && s.hostAliases[alias] {
+	if alias != "" && s.isHostAlias(alias) {
 		hostname = alias
 	}
 
@@ -850,10 +853,20 @@ func isUnicastQuestion(q dns.Question) bool {
 }
 
 func (s *Server) AddHostAlias(alias string) error {
+	s.hostAliasesLock.Lock()
+	defer s.hostAliasesLock.Unlock()
 	s.hostAliases[alias] = true
 	return nil
 }
 
 func (s *Server) RemoveHostAlias(alias string) {
+	s.hostAliasesLock.Lock()
+	defer s.hostAliasesLock.Unlock()
 	delete(s.hostAliases, alias)
+}
+
+func (s *Server) isHostAlias(name string) bool {
+	s.hostAliasesLock.RLock()
+	defer s.hostAliasesLock.RUnlock()
+	return s.hostAliases[name]
 }
